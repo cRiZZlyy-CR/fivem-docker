@@ -1,11 +1,18 @@
 # FiveM server image.
-# Set FXSERVER_VERSION to a build number from the FiveM Linux artifacts server:
+# Set FXSERVER_VERSION to a build id from the FiveM Linux artifacts server.
+# Look up the current "recommended" / "latest" build ids here:
+#   https://changelogs-live.fivem.net/api/changelog/versions/linux/server
 #   https://runtime.fivem.net/artifacts/fivem/build_proot_linux/master/
-FROM debian:bookworm-slim
+
+# Base image is configurable (default debian:bookworm-slim). The FiveM artifacts
+# bundle their own musl loader + libs, so the host distro only provides glibc to
+# the thin wrapper tools below — debian:trixie-slim works equally well.
+ARG BASE_IMAGE=debian:bookworm-slim
+FROM ${BASE_IMAGE}
 
 ARG FXSERVER_VERSION
 RUN test -n "$FXSERVER_VERSION" || { \
-      echo "ERROR: FXSERVER_VERSION build-arg is required (FiveM Linux artifacts build number)."; \
+      echo "ERROR: FXSERVER_VERSION build-arg is required (FiveM Linux artifacts build id)."; \
       echo "See https://runtime.fivem.net/artifacts/fivem/build_proot_linux/master/"; \
       exit 1; \
     }

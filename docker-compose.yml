@@ -1,14 +1,28 @@
+# Which database (if any) Compose starts is chosen by COMPOSE_PROFILES in .env:
+#   COMPOSE_PROFILES=postgres  → bundled PostgreSQL          (default)
+#   COMPOSE_PROFILES=mariadb   → bundled MariaDB             (FiveM/oxmysql standard)
+#   COMPOSE_PROFILES=          → no bundled DB; point *_HOST below at an EXISTING DB
+#
+# The fxserver has NO profile, so it ALWAYS runs. It deliberately does not
+# `depends_on` the database: per the Compose Spec an unprofiled service cannot
+# auto-activate a *profiled* dependency, so a hard depends_on would either fail
+# or force a DB on — breaking the "DB is optional" requirement. txAdmin boots
+# first anyway (the game server is started later), so the DB has time to come up;
+# both DB services expose a healthcheck for tooling that wants to wait.
 services:
   # ── PostgreSQL ────────────────────────────────────────────────────────────
-  # Available to your FiveM resources via the DATABASE_URL injected into the
-  # fxserver container below. NOT used by txAdmin itself (txAdmin's recipe
-  # deployer speaks MySQL/MariaDB) — this Postgres is for your own resources.
+  # Used by YOUR resources via the connection string injected into fxserver.
+  # NOT used by txAdmin itself (txAdmin's recipe deployer speaks MySQL/MariaDB).
   postgres:
-    image: postgres:16-alpine
+    image: postgres:${POSTGRES_VERSION:-18-alpine}
+    profiles: ["postgres"]
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-fivem}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Database password required — set POSTGRES_PASSWORD in .env}
+      # Empty default (not a :? guard) so a mariadb-only / external-DB user isn't
+      # blocked by a password for a service they don't run; the postgres image
+      # itself refuses to start with an empty password, so it still fails loudly.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
       POSTGRES_DB: ${POSTGRES_DB:-fivem}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
@@ -16,6 +30,32 @@ services:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fivem} -d ${POSTGRES_DB:-fivem}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MariaDB ───────────────────────────────────────────────────────────────
+  # The database most off-the-shelf FiveM resources expect (oxmysql, ESX, QBox…).
+  # MariaDB defaults to mysql_native_password, so it works with the oxmysql Node
+  # driver out of the box (unlike MySQL 8's default caching_sha2_password).
+  mariadb:
+    image: mariadb:${MARIADB_VERSION:-11.8}
+    profiles: ["mariadb"]
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${MYSQL_DB:-fivem}
+      MARIADB_USER: ${MYSQL_USER:-fivem}
+      # Empty defaults (not :? guards) so a postgres-only / external-DB user isn't
+      # blocked by passwords for a service they don't run; the mariadb image
+      # itself refuses to start without a root password, so it still fails loudly.
+      MARIADB_PASSWORD: ${MYSQL_PASSWORD:-}
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -30,21 +70,21 @@ services:
       context: .
       dockerfile: docker/fxserver.Dockerfile
       args:
-        # Build number from the FiveM Linux artifacts server:
-        #   https://runtime.fivem.net/artifacts/fivem/build_proot_linux/master/
-        FXSERVER_VERSION: ${FXSERVER_VERSION:?Set FXSERVER_VERSION in .env (FiveM Linux artifacts build number)}
+        # Base image is configurable; the FiveM artifacts bundle their own libc,
+        # so the host distro is non-critical. See .env.
+        BASE_IMAGE: ${BASE_IMAGE:-debian:bookworm-slim}
+        # Build id from the FiveM Linux artifacts server (see .env / changelog API).
+        FXSERVER_VERSION: ${FXSERVER_VERSION:?Set FXSERVER_VERSION in .env (FiveM Linux artifacts build id)}
     restart: unless-stopped
     stdin_open: true
     tty: true
-    depends_on:
-      postgres:
-        condition: service_healthy
     security_opt:
-      # Required for the proot-based FiveM Linux artifacts.
+      # Harmless for the current (musl-loader) FiveM artifacts; kept for older,
+      # genuinely proot/ptrace-based builds.
       - seccomp:unconfined
     ports:
-      - "30120:30120/tcp"   # game server
-      - "30120:30120/udp"   # game server
+      - "${GAME_PORT:-30120}:30120/tcp"   # game server
+      - "${GAME_PORT:-30120}:30120/udp"   # game server
       - "${TXADMIN_PORT:-40120}:40120/tcp" # txAdmin web panel (http://localhost:40120)
     volumes:
       # Your server lives here on the host: server.cfg + resources/.
@@ -57,12 +97,19 @@ services:
     environment:
       # txAdmin web port (v8 env config; replaces the deprecated txAdminPort ConVar).
       TXHOST_TXA_PORT: 40120
-      # Connection string for YOUR resources. Host is the compose service name.
-      DATABASE_URL: postgresql://${POSTGRES_USER:-fivem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fivem}
+      # Connection strings for YOUR resources. Built from the *_HOST / credential
+      # vars in .env (service name by default, or your external DB host). Use
+      # whichever matches your stack — both are harmless if unused.
+      #   Postgres → DATABASE_URL              (e.g. node-postgres `pg`)
+      #   MySQL    → MYSQL_CONNECTION_STRING   (oxmysql also reads a server.cfg convar)
+      DATABASE_URL: postgresql://${POSTGRES_USER:-fivem}:${POSTGRES_PASSWORD:-}@${POSTGRES_HOST:-postgres}:5432/${POSTGRES_DB:-fivem}
+      MYSQL_CONNECTION_STRING: mysql://${MYSQL_USER:-fivem}:${MYSQL_PASSWORD:-}@${MYSQL_HOST:-mariadb}:3306/${MYSQL_DB:-fivem}?charset=utf8mb4
       SERVER_PASSWORD: ${SERVER_PASSWORD:-}
 
 volumes:
   postgres_data:
+    driver: local
+  mariadb_data:
     driver: local
   fxserver_cache:
     driver: local
