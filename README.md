@@ -15,6 +15,7 @@ external), so the stack drops into an existing ecosystem without forcing a secon
 ```
 .
 ├── docker-compose.yml          # fxserver + optional postgres / mariadb
+├── docker-compose.traefik.yml  # OPT-IN: Traefik reverse proxy + Cloudflare DNS companion
 ├── docker/fxserver.Dockerfile  # downloads the FiveM Linux artifacts
 ├── .env.example                # configuration (copy to .env)
 └── server-data/                # your server (bind-mounted into the container)
@@ -76,6 +77,7 @@ Then:
 | `GAME_PORT`             | Host port for the game server, TCP+UDP (default 30120). |
 | `SERVER_PASSWORD`       | Optional connect password. |
 | `DATABASE_URL`          | Host-side connection string for psql/GUI tools (uses `localhost`). Not read by Compose. |
+| `TXADMIN_HOST` · `ACME_EMAIL` · `CF_*` | Reverse proxy + Cloudflare settings — only used by `docker-compose.traefik.yml`. See [Reverse proxy (Traefik) + Cloudflare](#reverse-proxy-traefik--cloudflare). |
 
 ## Your own resources
 
@@ -107,6 +109,86 @@ Use whichever matches your stack:
   contains reserved characters (`; , / ? : @ & = + $ #`), use the key=value form instead:
   `set mysql_connection_string "host=mariadb;port=3306;user=fivem;password=CHANGE_ME;database=fivem"`.
 
+## Reverse proxy (Traefik) + Cloudflare
+
+Optional, label-driven integration in **`docker-compose.traefik.yml`**. It adds a **Traefik v3**
+reverse proxy and a **Cloudflare DNS companion** (`tiredofit/traefik-cloudflare-companion`) that
+auto-creates DNS records from Traefik's `Host()` labels. The base stack is untouched — this file
+just layers on top and hands the ports to Traefik.
+
+> **How FiveM behaves behind a proxy/Cloudflare** (this drives the whole design):
+>
+> | Endpoint | Through Traefik | Through Cloudflare |
+> | -------- | --------------- | ------------------ |
+> | **txAdmin panel** (HTTP) | ✅ HTTPS via Traefik (Let's Encrypt) | ✅ orange-cloud proxy OK |
+> | **Game port 30120** (TCP + UDP/ENet) | ⚠️ L4 forward only | ❌ **never** — DNS-only (grey cloud) |
+>
+> Cloudflare's proxy/tunnel only carries HTTP/HTTPS, so the **game port must stay direct** (a
+> DNS-only A record to the server's real IP). And because Traefik forwards the game port at L4,
+> **FXServer sees Traefik's container IP for every player** — if you rely on real player IPs (IP
+> bans, rate-limiting, some anticheats), keep the game port published directly (see
+> [Panel-only variant](#panel-only-keep-the-game-port-direct) below).
+
+### Setup
+
+1. **Fill in the proxy/Cloudflare block in `.env`** (`TXADMIN_HOST`, `ACME_EMAIL`, `CF_API_TOKEN`,
+   `CF_TARGET_DOMAIN`, `CF_DOMAIN`, `CF_ZONE_ID`). The Cloudflare token is a **scoped API token**
+   with `Zone:Read` + `DNS:Edit` (template *"Edit zone DNS"*) — reused by both Traefik (for the
+   Let's Encrypt DNS-01 challenge) and the companion.
+
+2. **Create the game-port DNS record manually** (the companion only handles HTTP hosts): an
+   **A record set to "DNS only" (grey cloud)** pointing at the server's real IP, e.g.
+   `play.example.com → <server-ip>`. The panel record (`TXADMIN_HOST`) is created automatically as
+   a proxied record.
+
+3. **Start with both files:**
+
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+   ```
+
+   In Cloudflare, set the panel's SSL/TLS mode to **Full (strict)** — Traefik presents a real
+   Let's Encrypt certificate.
+
+> Requires **Docker Compose v2.24+** (the file uses the `!reset` tag to drop the base port
+> publishing). Tip: to make a plain `docker compose up` use this stack, set
+> `COMPOSE_FILE=docker-compose.yml:docker-compose.traefik.yml` in `.env`.
+
+### What the labels do
+
+| Router (label on `fxserver`) | Entrypoint | Purpose |
+| ---------------------------- | ---------- | ------- |
+| `txadmin` — HTTP, TLS, `Host()` rule | `websecure` (:443) | txAdmin panel over HTTPS → companion creates its DNS record |
+| `fivem-tcp` — TCP, `HostSNI` catch-all | `fivem-tcp` (:30120) | game TCP (connect/info endpoint + stream), raw L4 |
+| `fivem-udp` — UDP, no rule | `fivem-udp` (:30120/udp) | game UDP / ENet gameplay, raw L4 |
+
+Only the `txadmin` router has a `Host()` rule, so the companion creates **only** the panel's DNS
+record (proxied). The game routers have no hostname — that's why the game DNS record is manual and
+grey-cloud.
+
+### Optional `server.cfg` listing ConVars
+
+For the server browser to advertise your public game host (not the container IP), uncomment the
+**"Reverse proxy / server listing"** block in [`server-data/server.cfg`](server-data/server.cfg)
+and set your game host (`sv_listingHostOverride`, `sv_endpoints`, `sv_forceIndirectListing`,
+`sv_proxyIPRanges`).
+
+### Panel-only (keep the game port direct)
+
+If you only want the **txAdmin panel** behind Traefik/Cloudflare and prefer the game port published
+straight to the host (recommended when you need real player IPs), delete the three game-port pieces
+from `docker-compose.traefik.yml` — the `fivem-tcp` / `fivem-udp` entrypoints (in Traefik's
+`command`), their `30120` `ports:` lines on the `traefik` service, and the `traefik.tcp.*` /
+`traefik.udp.*` labels on `fxserver` — and change the `fxserver` port reset to republish just the
+game port directly (`!override` replaces the base list, so the txAdmin port stays Traefik-only):
+
+```yaml
+  fxserver:
+    ports: !override
+      - "${GAME_PORT:-30120}:30120/tcp"
+      - "${GAME_PORT:-30120}:30120/udp"
+```
+
 ## Platform support
 
 The **same `docker compose up` works on Windows and Linux automatically** — Docker runs the
@@ -125,6 +207,7 @@ Nothing to configure on either — the `platform: linux/amd64` pin in `docker-co
 ```bash
 docker compose up -d --build              # build + start (uses COMPOSE_PROFILES from .env)
 docker compose --profile mariadb up -d    # one-off: start with MariaDB regardless of .env
+docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build  # + Traefik & Cloudflare
 docker compose logs -f fxserver           # server logs
 docker compose ps                         # status
 docker compose down                       # stop (volumes/data preserved)

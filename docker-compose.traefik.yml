@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# OPT-IN: Traefik reverse proxy + Cloudflare DNS companion (labels-driven).
+#
+# This is a self-contained add-on layered ON TOP of the base stack. It is NOT
+# auto-loaded — enable it explicitly:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+#
+# (Listing files with -f skips the auto-loaded docker-compose.override.yml — which
+#  doesn't exist here, that's fine — and lets this file `!reset` the fxserver host
+#  ports so Traefik can own :80/:443/:30120 without a port collision.)
+#
+# Requires Docker Compose v2.24+ (for the `!reset` tag).
+#
+# ⚠️ FiveM reality check — read the README "Reverse proxy (Traefik) + Cloudflare":
+#   • txAdmin panel (HTTP)  → Traefik serves it over HTTPS, and it CAN sit behind
+#     Cloudflare's orange-cloud proxy. The companion auto-creates its DNS record.
+#   • Game port 30120 (TCP + the UDP/ENet gameplay) → Traefik forwards it at L4,
+#     but it CANNOT go through Cloudflare's proxy/tunnel on any normal plan. Give
+#     it a DNS-only (grey-cloud) A record pointing at the server's real IP.
+#   • L4-forwarding the game port makes FXServer see Traefik's container IP as
+#     every player's IP (affects IP bans / rate-limiting / some anticheats). If
+#     you depend on real player IPs, keep the game port published directly instead
+#     (delete the tcp/udp entrypoints + labels here — see the README).
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  traefik:
+    image: traefik:v3.7
+    restart: unless-stopped
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      # ── Entrypoints (each must also be published under `ports:` below) ──
+      - "--entryPoints.web.address=:80"
+      - "--entryPoints.websecure.address=:443"
+      - "--entryPoints.fivem-tcp.address=:30120/tcp"
+      - "--entryPoints.fivem-udp.address=:30120/udp"
+      # Redirect plain HTTP → HTTPS for web routers (txAdmin panel).
+      - "--entryPoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entryPoints.web.http.redirections.entrypoint.scheme=https"
+      # ── Let's Encrypt via Cloudflare DNS-01 challenge ──
+      # Works even when the panel is behind the CF proxy and without inbound
+      # :80/:443 from the internet. Reuses the same scoped token as the companion.
+      - "--certificatesresolvers.le.acme.dnschallenge=true"
+      - "--certificatesresolvers.le.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL:?Set ACME_EMAIL in .env}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      # While testing, uncomment to use LE staging (avoids hitting rate limits):
+      # - "--certificatesresolvers.le.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory"
+      # Optional dashboard (kept off by default). To enable, add "--api.dashboard=true"
+      # plus a Host()-labelled router for the traefik service — see the README.
+    environment:
+      # Cloudflare scoped API token for the DNS-01 challenge (Zone:Read + DNS:Edit).
+      CF_DNS_API_TOKEN: ${CF_API_TOKEN:?Set CF_API_TOKEN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "${GAME_PORT:-30120}:30120/tcp"
+      - "${GAME_PORT:-30120}:30120/udp"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_letsencrypt:/letsencrypt
+
+  # ── Cloudflare DNS companion ────────────────────────────────────────────────
+  # Watches the Docker socket for Traefik Host() router labels and creates/updates
+  # matching Cloudflare DNS records (a CNAME → TARGET_DOMAIN). Here it picks up the
+  # txAdmin panel host and makes it a proxied (orange-cloud) record.
+  cloudflare-companion:
+    image: tiredofit/traefik-cloudflare-companion:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      TRAEFIK_VERSION: "2"          # label format only; Traefik v3 uses the same Host() syntax
+      REFRESH_ENTRIES: "TRUE"       # update existing records instead of skipping them
+      RC_TYPE: CNAME
+      DEFAULT_TTL: "1"              # 1 = automatic
+      CF_TOKEN: ${CF_API_TOKEN:?Set CF_API_TOKEN in .env}
+      CF_EMAIL: ""                  # leave blank when using a scoped API token
+      TARGET_DOMAIN: ${CF_TARGET_DOMAIN:?Set CF_TARGET_DOMAIN in .env}  # what the CNAME points at
+      DOMAIN1: ${CF_DOMAIN:?Set CF_DOMAIN in .env}
+      DOMAIN1_ZONE_ID: ${CF_ZONE_ID:?Set CF_ZONE_ID in .env}
+      DOMAIN1_PROXIED: "TRUE"       # txAdmin panel → orange cloud (HTTP works through CF)
+
+  # ── fxserver: hand the ports to Traefik + add routing labels ────────────────
+  fxserver:
+    # Drop the base file's direct host-port publishing so :30120 / :40120 don't
+    # collide with Traefik, which now owns them. (`!reset` needs Compose v2.24+.)
+    ports: !reset []
+    environment:
+      # Tell txAdmin its public URL so it emits correct absolute (HTTPS) links
+      # and cookies behind the proxy.
+      TXHOST_TXA_URL: https://${TXADMIN_HOST:?Set TXADMIN_HOST in .env}
+    labels:
+      - "traefik.enable=true"
+      # ── txAdmin web panel → HTTPS. Cloudflare-proxyable (orange). The companion
+      #    creates this hostname's DNS record from the Host() rule below.
+      - "traefik.http.routers.txadmin.entrypoints=websecure"
+      - "traefik.http.routers.txadmin.rule=Host(`${TXADMIN_HOST}`)"
+      - "traefik.http.routers.txadmin.tls=true"
+      - "traefik.http.routers.txadmin.tls.certresolver=le"
+      - "traefik.http.services.txadmin.loadbalancer.server.port=40120"
+      # ── FiveM game TCP — raw L4 passthrough (NO TLS): serves the HTTP connect/
+      #    info endpoint + the game TCP stream. HostSNI(`*`) is the only valid rule
+      #    for a non-TLS TCP router.
+      - "traefik.tcp.routers.fivem-tcp.entrypoints=fivem-tcp"
+      - "traefik.tcp.routers.fivem-tcp.rule=HostSNI(`*`)"
+      - "traefik.tcp.routers.fivem-tcp.service=fivem-tcp"
+      - "traefik.tcp.services.fivem-tcp.loadbalancer.server.port=30120"
+      # ── FiveM game UDP — raw L4 passthrough (ENet gameplay). UDP routers take
+      #    NO rule; they are matched purely by their entrypoint.
+      - "traefik.udp.routers.fivem-udp.entrypoints=fivem-udp"
+      - "traefik.udp.routers.fivem-udp.service=fivem-udp"
+      - "traefik.udp.services.fivem-udp.loadbalancer.server.port=30120"
+
+volumes:
+  traefik_letsencrypt:
+    driver: local
